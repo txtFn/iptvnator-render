@@ -1,6 +1,14 @@
 
 FROM 4gray/iptvnator:latest
 
+# Dependencies for encrypted SQLite backups
+RUN apk add --no-cache \
+    python3 \
+    py3-cryptography \
+    sqlite \
+    curl \
+    ca-certificates
+
 # Use port 3000 for the internal backend
 ENV PORT=3000
 ENV BACKEND_URL=/api
