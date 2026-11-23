@@ -1,5 +1,5 @@
 
-name: Inspect IPTVnator Docker Image
+name: Inspect Custom IPTVnator Image
 
 on:
   workflow_dispatch:
@@ -9,29 +9,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Inspect base image
-        run: |
-          docker pull 4gray/iptvnator:latest
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Build custom image
+        run: docker build -t iptvnator-custom:test .
+
+      - name: Verify backup dependencies
+        run: |
           docker run --rm \
             --entrypoint /bin/sh \
-            4gray/iptvnator:latest \
+            iptvnator-custom:test \
             -c '
-              echo "=== Operating system ==="
-              cat /etc/os-release
-
-              echo "=== Available commands ==="
-              for cmd in python3 sqlite3 curl openssl apk apt-get; do
-                if command -v "$cmd" >/dev/null 2>&1; then
-                  echo "$cmd: available"
-                else
-                  echo "$cmd: missing"
-                fi
-              done
-
-              echo "=== Entrypoint ==="
-              command -v iptvnator-entrypoint || true
-
-              echo "=== Data directory ==="
-              ls -ld /data /data/databases 2>/dev/null || true
+              set -e
+              python3 --version
+              python3 -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM; print(\"Encryption: available\")"
+              sqlite3 --version
+              curl --version
+              echo "Backup dependencies verified"
             '
