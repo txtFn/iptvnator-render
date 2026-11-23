@@ -1,0 +1,37 @@
+
+name: Inspect IPTVnator Docker Image
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Inspect base image
+        run: |
+          docker pull 4gray/iptvnator:latest
+
+          docker run --rm \
+            --entrypoint /bin/sh \
+            4gray/iptvnator:latest \
+            -c '
+              echo "=== Operating system ==="
+              cat /etc/os-release
+
+              echo "=== Available commands ==="
+              for cmd in python3 sqlite3 curl openssl apk apt-get; do
+                if command -v "$cmd" >/dev/null 2>&1; then
+                  echo "$cmd: available"
+                else
+                  echo "$cmd: missing"
+                fi
+              done
+
+              echo "=== Entrypoint ==="
+              command -v iptvnator-entrypoint || true
+
+              echo "=== Data directory ==="
+              ls -ld /data /data/databases 2>/dev/null || true
+            '
