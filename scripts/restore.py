@@ -1,4 +1,3 @@
-
 import base64
 import os
 import sqlite3
@@ -19,24 +18,48 @@ BACKUP_PATH = "backups/iptvnator.db.enc"
 def download_backup():
     token = os.environ["GITHUB_BACKUP_TOKEN"]
 
-    url = (
-        f"https://api.github.com/repos/"
-        f"{REPOSITORY}/contents/{BACKUP_PATH}"
+    base_url = (
+        f"https://api.github.com/repos/{REPOSITORY}"
     )
 
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.raw+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "IPTVnator-Restore",
+    }
+
+    # Verify repository access before treating a 404
+    # response as a missing backup.
     request = urllib.request.Request(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github.raw+json",
-            "User-Agent": "IPTVnator-Restore"
-        }
+        base_url,
+        headers=headers,
     )
 
     with urllib.request.urlopen(
         request, timeout=60
     ) as response:
-        return response.read()
+        response.read()
+
+    url = f"{base_url}/contents/{BACKUP_PATH}"
+
+    request = urllib.request.Request(
+        url,
+        headers=headers,
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request, timeout=60
+        ) as response:
+            return response.read()
+
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            print("Production backup not found")
+            return None
+
+        raise
 
 
 def restore_database():
@@ -46,7 +69,7 @@ def restore_database():
 
     key = base64.b64decode(
         os.environ["BACKUP_ENCRYPTION_KEY"],
-        validate=True
+        validate=True,
     )
 
     if len(key) != 32:
@@ -58,22 +81,31 @@ def restore_database():
 
     encrypted = download_backup()
 
+    if encrypted is None:
+        print("No production backup available")
+        print("IPTVnator may initialize a new database")
+        return
+
     if not encrypted.startswith(MAGIC):
         raise RuntimeError("Invalid backup format")
 
+    if len(encrypted) < len(MAGIC) + 12 + 16:
+        raise RuntimeError("Incomplete encrypted backup")
+
     offset = len(MAGIC)
+
     nonce = encrypted[offset:offset + 12]
     ciphertext = encrypted[offset + 12:]
 
     recovered = AESGCM(key).decrypt(
         nonce,
         ciphertext,
-        MAGIC
+        MAGIC,
     )
 
     DATABASE.parent.mkdir(
         parents=True,
-        exist_ok=True
+        exist_ok=True,
     )
 
     with tempfile.TemporaryDirectory(
@@ -86,7 +118,7 @@ def restore_database():
 
         connection = sqlite3.connect(
             f"file:{restored}?mode=ro",
-            uri=True
+            uri=True,
         )
 
         try:
@@ -98,6 +130,18 @@ def restore_database():
                 raise RuntimeError(
                     "Restored database integrity check failed"
                 )
+
+            tables = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchone()[0]
+
+            if tables == 0:
+                raise RuntimeError(
+                    "Restored database has an empty schema"
+                )
+
         finally:
             connection.close()
 
