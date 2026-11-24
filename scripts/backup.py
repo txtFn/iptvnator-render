@@ -171,6 +171,35 @@ def create_backup():
                     "Empty database schema; backup aborted"
                 )
 
+            # Protect production backups from empty databases.
+            if os.getenv("BACKUP_TEST_MODE") != "1":
+                playlist_table = check.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table' AND name='playlists'"
+                ).fetchone()[0]
+
+                if playlist_table == 0:
+                    raise RuntimeError(
+                        "Playlists table missing; backup aborted"
+                    )
+
+                playlist_count = check.execute(
+                    "SELECT COUNT(*) FROM playlists"
+                ).fetchone()[0]
+
+                print(f"Playlist count: {playlist_count}")
+
+                if playlist_count == 0:
+                    raise RuntimeError(
+                        "No playlists found; backup aborted "
+                        "to protect existing remote backup"
+                    )
+
+                print("Production playlist validation passed")
+
+            else:
+                print("Test mode: playlist validation skipped")
+        
         finally:
             check.close()
 
