@@ -1,0 +1,91 @@
+name: Test IPTVnator Runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t iptvnator-runtime:test .
+
+      - name: Prepare disposable database
+        run: |
+          mkdir -p test-data/databases
+
+          python3 - <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect(
+              "test-data/databases/iptvnator.db"
+          )
+
+          db.execute(
+              "CREATE TABLE test_backup (id INTEGER PRIMARY KEY)"
+          )
+
+          db.execute(
+              "INSERT INTO test_backup VALUES (1)"
+          )
+
+          db.commit()
+          db.close()
+          PY
+
+          chmod -R a+rwX test-data
+
+      - name: Start IPTVnator container
+        run: |
+          docker run -d \
+            --name iptvnator-runtime \
+            -p 127.0.0.1:10000:10000 \
+            -e BACKUP_UPLOAD_ENABLED=0 \
+            -v "$PWD/test-data:/data" \
+            iptvnator-runtime:test
+
+      - name: Wait for IPTVnator
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 5 \
+              http://localhost:10000/ \
+              -o /dev/null; then
+              echo "IPTVnator frontend is responding"
+              exit 0
+            fi
+
+            sleep 5
+          done
+
+          echo "IPTVnator failed to respond"
+          exit 1
+
+      - name: Verify existing database protection
+        run: |
+          docker exec iptvnator-runtime \
+            sqlite3 /data/databases/iptvnator.db \
+            "SELECT * FROM test_backup;"
+
+          docker logs iptvnator-runtime 2>&1 | \
+            grep -F "Existing database found; restore skipped"
+
+      - name: Verify automatic uploads are disabled
+        run: |
+          docker logs iptvnator-runtime 2>&1 | \
+            grep -F "Automatic uploads disabled"
+
+      - name: Display container logs
+        if: always()
+        run: docker logs iptvnator-runtime || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f iptvnator-runtime || true
