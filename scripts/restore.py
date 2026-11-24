@@ -12,8 +12,11 @@ DATABASE = Path("/data/databases/iptvnator.db")
 MAGIC = b"IPTVBACKUP1"
 
 REPOSITORY = "txtFn/iptvnator-backups"
-BACKUP_PATH = "backups/iptvnator.db.enc"
-
+BACKUP_PATH = (
+    "test/backup.db.enc"
+    if os.getenv("BACKUP_TEST_MODE") == "1"
+    else "backups/iptvnator.db.enc"
+)
 
 def download_backup():
     token = os.environ["GITHUB_BACKUP_TOKEN"]
@@ -81,7 +84,18 @@ def restore_database():
 
     encrypted = download_backup()
 
-    if encrypted is None:
+        if encrypted is None:
+        if os.getenv("BACKUP_TEST_MODE") == "1":
+            raise RuntimeError(
+                "Required test backup not found"
+            )
+
+        if os.getenv("ALLOW_INITIAL_SETUP") != "1":
+            raise RuntimeError(
+                "Production backup not found; "
+                "initial setup is not authorized"
+            )
+
         print("No production backup available")
         print("IPTVnator may initialize a new database")
         return
