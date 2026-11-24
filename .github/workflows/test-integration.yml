@@ -1,0 +1,75 @@
+
+name: Test IPTVnator Docker Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build integrated Docker image
+        run: docker build -t iptvnator-integrated:test .
+
+      - name: Verify installed dependencies
+        run: |
+          docker run --rm \
+            --entrypoint /bin/sh \
+            iptvnator-integrated:test \
+            -c '
+              set -e
+              python3 --version
+              sqlite3 --version
+              curl --version
+              python3 -c "from cryptography.hazmat.primitives.ciphers.aead import AESGCM"
+              echo "All dependencies available"
+            '
+
+      - name: Verify backup and restore scripts
+        run: |
+          docker run --rm \
+            --entrypoint /bin/sh \
+            iptvnator-integrated:test \
+            -c '
+              set -e
+
+              cd /opt/iptvnator-backup
+
+              test -f backup.py
+              test -f restore.py
+              test -x startup.sh
+
+              python3 -m py_compile backup.py restore.py
+              sh -n startup.sh
+
+              echo "All scripts verified"
+            '
+
+      - name: Verify original IPTVnator startup
+        run: |
+          docker run --rm \
+            --entrypoint /bin/sh \
+            iptvnator-integrated:test \
+            -c '
+              set -e
+              command -v iptvnator-entrypoint
+              echo "Original startup command available"
+            '
+
+      - name: Verify Docker configuration
+        run: |
+          docker image inspect iptvnator-integrated:test \
+            --format '{{json .Config.Entrypoint}}'
+
+          docker image inspect iptvnator-integrated:test \
+            --format '{{json .Config.ExposedPorts}}'
+
+          echo "ALL INTEGRATION CHECKS PASSED"
