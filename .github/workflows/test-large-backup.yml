@@ -1,0 +1,101 @@
+name: Test IPTVnator Large Database Backup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-large-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t iptvnator-large:test .
+
+      - name: Test large SQLite backups
+        run: |
+          docker run --rm -i \
+            --entrypoint /bin/sh \
+            -e BACKUP_UPLOAD_ENABLED=0 \
+            -e BACKUP_TEST_MODE=0 \
+            iptvnator-large:test <<'SH'
+
+          set -eu
+
+          export BACKUP_ENCRYPTION_KEY="$(python3 -c 'import os,base64; print(base64.b64encode(os.urandom(32)).decode())')"
+
+          DB="/data/databases/iptvnator.db"
+          SCRIPT="/opt/iptvnator-backup/backup.py"
+
+          mkdir -p /data/databases
+
+          for SIZE in 5 25 75; do
+
+              echo "================================"
+              echo "TEST: Approximately ${SIZE} MB database"
+              echo "================================"
+
+              rm -f "$DB" "$DB-wal" "$DB-shm"
+
+              export TEST_SIZE="$SIZE"
+
+              python3 - <<'PY'
+          import os
+          import sqlite3
+
+          size = int(os.environ["TEST_SIZE"])
+
+          db = sqlite3.connect(
+              "/data/databases/iptvnator.db"
+          )
+
+          db.execute("PRAGMA journal_mode=WAL")
+
+          db.execute(
+              "CREATE TABLE playlists "
+              "(id TEXT PRIMARY KEY, name TEXT NOT NULL)"
+          )
+
+          db.execute(
+              "INSERT INTO playlists VALUES "
+              "('test-1', 'Large Test Playlist')"
+          )
+
+          db.execute(
+              "CREATE TABLE test_payload "
+              "(id INTEGER PRIMARY KEY, payload BLOB)"
+          )
+
+          for i in range(size * 256):
+              db.execute(
+                  "INSERT INTO test_payload (payload) "
+                  "VALUES (?)",
+                  (os.urandom(4096),)
+              )
+
+          db.commit()
+          db.close()
+          PY
+
+              echo "Database file size:"
+              ls -lh "$DB"
+
+              echo "Starting encrypted backup"
+
+              time python3 "$SCRIPT"
+
+              echo "PASS: ${SIZE} MB backup verified"
+
+          done
+
+          echo "================================"
+          echo "ALL LARGE BACKUP TESTS PASSED"
+          echo "================================"
+
+          SH
