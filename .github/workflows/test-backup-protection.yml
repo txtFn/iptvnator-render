@@ -1,0 +1,115 @@
+name: Test IPTVnator Backup Protection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-protection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t iptvnator-protection:test .
+
+      - name: Test backup protection
+        run: |
+          docker run --rm -i \
+            --entrypoint /bin/sh \
+            -e BACKUP_UPLOAD_ENABLED=0 \
+            iptvnator-protection:test <<'SH'
+
+          set -eu
+
+          export BACKUP_ENCRYPTION_KEY="$(python3 -c 'import os,base64; print(base64.b64encode(os.urandom(32)).decode())')"
+
+          export BACKUP_TEST_MODE=0
+
+          DB="/data/databases/iptvnator.db"
+          SCRIPT="/opt/iptvnator-backup/backup.py"
+
+          mkdir -p /data/databases
+
+          reset_database() {
+              rm -f "$DB" "$DB-wal" "$DB-shm"
+          }
+
+          expect_rejection() {
+              if python3 "$SCRIPT" > /tmp/result.log 2>&1; then
+                  cat /tmp/result.log
+                  echo "FAIL: Backup should have been rejected"
+                  exit 1
+              fi
+
+              cat /tmp/result.log
+              grep -F "$1" /tmp/result.log
+              echo "PASS: Backup correctly rejected"
+          }
+
+          echo "================================"
+          echo "TEST 1: Missing playlists table"
+          echo "================================"
+
+          reset_database
+
+          sqlite3 "$DB" \
+              "CREATE TABLE test_backup (id INTEGER PRIMARY KEY);"
+
+          expect_rejection "Playlists table missing"
+
+          echo "================================"
+          echo "TEST 2: Empty playlists table"
+          echo "================================"
+
+          reset_database
+
+          sqlite3 "$DB" \
+              "CREATE TABLE playlists (id TEXT PRIMARY KEY, name TEXT NOT NULL);"
+
+          expect_rejection "No playlists found"
+
+          echo "================================"
+          echo "TEST 3: Database with a playlist"
+          echo "================================"
+
+          sqlite3 "$DB" \
+              "INSERT INTO playlists VALUES ('test-1', 'Test Playlist');"
+
+          python3 "$SCRIPT" > /tmp/result.log 2>&1
+          cat /tmp/result.log
+
+          grep -F "Production playlist validation passed" /tmp/result.log
+          grep -F "Encrypted SQLite snapshot verified" /tmp/result.log
+
+          echo "PASS: Populated database accepted"
+
+          echo "================================"
+          echo "TEST 4: Test mode bypass"
+          echo "================================"
+
+          reset_database
+
+          sqlite3 "$DB" \
+              "CREATE TABLE test_backup (id INTEGER PRIMARY KEY);"
+
+          export BACKUP_TEST_MODE=1
+
+          python3 "$SCRIPT" > /tmp/result.log 2>&1
+          cat /tmp/result.log
+
+          grep -F "Test mode: playlist validation skipped" /tmp/result.log
+          grep -F "Encrypted SQLite snapshot verified" /tmp/result.log
+
+          echo "PASS: Test mode works correctly"
+
+          echo "================================"
+          echo "ALL BACKUP PROTECTION TESTS PASSED"
+          echo "================================"
+
+          SH
