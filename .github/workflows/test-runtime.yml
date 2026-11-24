@@ -82,6 +82,31 @@ jobs:
           docker logs iptvnator-runtime 2>&1 | \
             grep -F "Automatic uploads disabled"
 
+      - name: Inspect IPTVnator database schema
+        run: |
+          echo "=== DATABASE FILES ==="
+
+          docker exec iptvnator-runtime \
+            ls -lah /data/databases
+
+          echo "=== DATABASE TABLES ==="
+
+          docker exec iptvnator-runtime \
+            sqlite3 /data/databases/iptvnator.db \
+            ".tables"
+
+          echo "=== DATABASE SCHEMA ==="
+
+          docker exec iptvnator-runtime \
+            sqlite3 /data/databases/iptvnator.db \
+            ".schema"
+
+          echo "=== DATABASE INTEGRITY ==="
+
+          docker exec iptvnator-runtime \
+            sqlite3 /data/databases/iptvnator.db \
+            "PRAGMA integrity_check;"
+
       - name: Display container logs
         if: always()
         run: docker logs iptvnator-runtime || true
