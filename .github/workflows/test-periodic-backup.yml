@@ -1,0 +1,251 @@
+name: Test IPTVnator Periodic Backup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iptvnator-remote-backup-test
+  cancel-in-progress: false
+
+jobs:
+  test-periodic-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t iptvnator-periodic:test .
+
+      - name: Prepare empty storage
+        run: |
+          mkdir -p periodic-data
+          chmod 777 periodic-data
+
+          test ! -f periodic-data/databases/iptvnator.db
+
+          echo "Empty storage verified"
+
+      - name: Start IPTVnator with automatic backups
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          GITHUB_BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          docker run -d \
+            --name iptvnator-periodic \
+            --memory=512m \
+            --memory-swap=512m \
+            --cpus=0.1 \
+            -p 127.0.0.1:10000:10000 \
+            -e BACKUP_ENCRYPTION_KEY \
+            -e GITHUB_BACKUP_TOKEN \
+            -e BACKUP_TEST_MODE=1 \
+            -e BACKUP_UPLOAD_ENABLED=1 \
+            -e BACKUP_INTERVAL_SECONDS=10 \
+            -e MAX_BACKUP_SIZE_MB=25 \
+            -e ALLOW_INITIAL_SETUP=0 \
+            -v "$PWD/periodic-data:/data" \
+            iptvnator-periodic:test
+
+      - name: Wait for IPTVnator startup
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 5 \
+              http://localhost:10000/ \
+              -o /dev/null; then
+
+              echo "IPTVnator is responding"
+              exit 0
+            fi
+
+            if [ "$(docker inspect \
+              -f '{{.State.Running}}' \
+              iptvnator-periodic)" != "true" ]; then
+
+              echo "Container stopped unexpectedly"
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+          echo "IPTVnator startup timed out"
+          exit 1
+
+      - name: Verify automatic backup worker
+        run: |
+          docker logs iptvnator-periodic \
+            > periodic.log 2>&1
+
+          grep -F "Automatic backup worker started" \
+            periodic.log
+
+          grep -F "Interval: 10 seconds" \
+            periodic.log
+
+          echo "PASS: Automatic backup worker started"
+
+      - name: Modify test database
+        run: |
+          MARKER="Periodic Test ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "TEST_MARKER=$MARKER" >> "$GITHUB_ENV"
+
+          docker exec iptvnator-periodic \
+            sqlite3 /data/databases/iptvnator.db \
+            "UPDATE playlists SET name='$MARKER' WHERE id='test-1';"
+
+          RESULT=$(docker exec iptvnator-periodic \
+            sqlite3 /data/databases/iptvnator.db \
+            "SELECT name FROM playlists WHERE id='test-1';")
+
+          test "$RESULT" = "$MARKER"
+
+          echo "PASS: Test database modified"
+
+      - name: Wait for automatic remote backup
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          GITHUB_BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          for i in $(seq 1 30); do
+
+            if docker run --rm \
+              --entrypoint /bin/sh \
+              -e BACKUP_ENCRYPTION_KEY \
+              -e GITHUB_BACKUP_TOKEN \
+              -e BACKUP_TEST_MODE=1 \
+              -e ALLOW_INITIAL_SETUP=0 \
+              -e TEST_MARKER \
+              iptvnator-periodic:test \
+              -c '
+                set -eu
+
+                rm -f /data/databases/iptvnator.db \
+                  /data/databases/iptvnator.db-wal \
+                  /data/databases/iptvnator.db-shm
+
+                python3 /opt/iptvnator-backup/restore.py
+
+                RESULT=$(sqlite3 \
+                  /data/databases/iptvnator.db \
+                  "SELECT name FROM playlists WHERE id='\''test-1'\'';")
+
+                test "$RESULT" = "$TEST_MARKER"
+              '; then
+
+              echo "PASS: Modified database automatically uploaded"
+              echo "PASS: Remote backup contains latest playlist"
+              exit 0
+            fi
+
+            echo "Waiting for periodic backup..."
+            sleep 10
+
+          done
+
+          echo "Automatic backup verification timed out"
+          exit 1
+
+      - name: Verify duplicate upload prevention
+        run: |
+          for i in $(seq 1 24); do
+
+            docker logs iptvnator-periodic \
+              > periodic.log 2>&1
+
+            if grep -F "Database unchanged; upload skipped" \
+              periodic.log; then
+
+              echo "PASS: Duplicate upload prevented"
+              exit 0
+            fi
+
+            sleep 5
+
+          done
+
+          echo "No unchanged backup detected"
+          exit 1
+
+      - name: Display memory usage
+        run: |
+          docker stats --no-stream \
+            iptvnator-periodic
+
+          LIMIT=$(docker exec iptvnator-periodic \
+            cat /sys/fs/cgroup/memory.max)
+
+          PEAK=$(docker exec iptvnator-periodic \
+            cat /sys/fs/cgroup/memory.peak)
+
+          echo "Memory limit: $LIMIT bytes"
+
+          awk -v peak="$PEAK" \
+            'BEGIN {printf "Peak memory: %.2f MiB\n", peak/1048576}'
+
+          awk -v peak="$PEAK" -v limit="$LIMIT" \
+            'BEGIN {printf "Peak memory utilization: %.2f%%\n", peak/limit*100}'
+
+          EVENTS=$(docker exec iptvnator-periodic \
+            cat /sys/fs/cgroup/memory.events)
+
+          echo "$EVENTS"
+
+          OOM=$(docker inspect \
+            -f '{{.State.OOMKilled}}' \
+            iptvnator-periodic)
+
+          echo "OOM killed: $OOM"
+
+          test "$LIMIT" = "536870912"
+          test "$PEAK" -lt "$LIMIT"
+          test "$OOM" = "false"
+
+          echo "$EVENTS" | grep -x "oom 0"
+          echo "$EVENTS" | grep -x "oom_kill 0"
+
+          echo "PASS: Memory usage within limit"
+
+      - name: Stop periodic backup worker
+        run: docker stop iptvnator-periodic
+
+      - name: Reset disposable remote backup
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          GITHUB_BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          docker run --rm \
+            --entrypoint /bin/sh \
+            -e BACKUP_ENCRYPTION_KEY \
+            -e GITHUB_BACKUP_TOKEN \
+            -e BACKUP_TEST_MODE=1 \
+            -e BACKUP_UPLOAD_ENABLED=1 \
+            -e MAX_BACKUP_SIZE_MB=25 \
+            -v "$PWD/periodic-data:/data" \
+            iptvnator-periodic:test \
+            -c '
+              set -eu
+
+              sqlite3 /data/databases/iptvnator.db \
+                "UPDATE playlists SET name='\''Modified Test Playlist'\'' WHERE id='\''test-1'\'';"
+
+              python3 /opt/iptvnator-backup/backup.py
+            '
+
+      - name: Confirm all periodic backup tests passed
+        run: |
+          echo "ALL PERIODIC BACKUP TESTS PASSED"
+
+      - name: Display container logs
+        if: always()
+        run: docker logs iptvnator-periodic || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f iptvnator-periodic || true
