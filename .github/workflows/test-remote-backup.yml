@@ -1,0 +1,152 @@
+name: Test IPTVnator Remote Backup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iptvnator-remote-backup-test
+  cancel-in-progress: false
+
+jobs:
+  test-remote-backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t iptvnator-remote:test .
+
+      - name: Test remote backup and duplicate prevention
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          GITHUB_BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          docker run --rm -i \
+            --entrypoint /bin/sh \
+            -e BACKUP_ENCRYPTION_KEY \
+            -e GITHUB_BACKUP_TOKEN \
+            -e BACKUP_UPLOAD_ENABLED=1 \
+            -e BACKUP_TEST_MODE=1 \
+            -e MAX_BACKUP_SIZE_MB=25 \
+            iptvnator-remote:test <<'SH'
+
+          set -eu
+
+          DB="/data/databases/iptvnator.db"
+          SCRIPT="/opt/iptvnator-backup/backup.py"
+
+          mkdir -p /data/databases
+
+          rm -f "$DB" "$DB-wal" "$DB-shm"
+
+          echo "================================"
+          echo "Preparing large test database"
+          echo "================================"
+
+          python3 - <<'PY'
+          import os
+          import sqlite3
+
+          db = sqlite3.connect(
+              "/data/databases/iptvnator.db"
+          )
+
+          db.execute(
+              "CREATE TABLE playlists "
+              "(id TEXT PRIMARY KEY, name TEXT NOT NULL)"
+          )
+
+          db.execute(
+              "INSERT INTO playlists VALUES "
+              "('test-1', 'Remote Test Playlist')"
+          )
+
+          db.execute(
+              "CREATE TABLE test_payload "
+              "(id INTEGER PRIMARY KEY, payload BLOB)"
+          )
+
+          for i in range(1280):
+              db.execute(
+                  "INSERT INTO test_payload (payload) VALUES (?)",
+                  (os.urandom(4096),)
+              )
+
+          db.commit()
+          db.close()
+          PY
+
+          ls -lh "$DB"
+
+          echo "================================"
+          echo "TEST 1: Large remote backup upload"
+          echo "================================"
+
+          python3 "$SCRIPT" > /tmp/result.log 2>&1
+          cat /tmp/result.log
+
+          grep -F "Encrypted backup uploaded successfully" \
+              /tmp/result.log
+
+          echo "PASS: Large backup uploaded"
+
+          echo "================================"
+          echo "TEST 2: Duplicate upload prevention"
+          echo "================================"
+
+          python3 "$SCRIPT" > /tmp/result.log 2>&1
+          cat /tmp/result.log
+
+          grep -F "Database unchanged; upload skipped" \
+              /tmp/result.log
+
+          echo "PASS: Duplicate upload prevented"
+
+          echo "================================"
+          echo "TEST 3: Modified database upload"
+          echo "================================"
+
+          sqlite3 "$DB" \
+              "UPDATE playlists SET name='Modified Test Playlist';"
+
+          python3 "$SCRIPT" > /tmp/result.log 2>&1
+          cat /tmp/result.log
+
+          grep -F "Database changes detected" \
+              /tmp/result.log
+
+          grep -F "Encrypted backup uploaded successfully" \
+              /tmp/result.log
+
+          echo "PASS: Modified database uploaded"
+
+          echo "================================"
+          echo "TEST 4: Backup size protection"
+          echo "================================"
+
+          export MAX_BACKUP_SIZE_MB=1
+
+          if python3 "$SCRIPT" > /tmp/result.log 2>&1; then
+              cat /tmp/result.log
+              echo "FAIL: Oversized backup was accepted"
+              exit 1
+          fi
+
+          cat /tmp/result.log
+
+          grep -F "Snapshot exceeds configured" \
+              /tmp/result.log
+
+          echo "PASS: Oversized backup rejected"
+
+          echo "================================"
+          echo "ALL REMOTE BACKUP TESTS PASSED"
+          echo "================================"
+
+          SH
