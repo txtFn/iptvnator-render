@@ -1,0 +1,86 @@
+
+name: Test IPTVnator SQLite Restoration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install encryption dependency
+        run: pip install cryptography
+
+      - name: Test encrypted database restoration
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          GITHUB_BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          python - <<'PY'
+          import sys
+          import sqlite3
+          import tempfile
+          import hashlib
+          from pathlib import Path
+
+          sys.path.insert(0, "scripts")
+          import restore
+
+          with tempfile.TemporaryDirectory() as folder:
+              restore.DATABASE = Path(folder) / "iptvnator.db"
+              restore.BACKUP_PATH = "test/backup.db.enc"
+
+              restore.restore_database()
+
+              assert restore.DATABASE.is_file(), \
+                  "Restored database missing"
+
+              with sqlite3.connect(
+                  str(restore.DATABASE)
+              ) as connection:
+                  result = connection.execute(
+                      "PRAGMA integrity_check"
+                  ).fetchone()
+
+                  assert result == ("ok",), \
+                      "Integrity check failed"
+
+                  tables = connection.execute(
+                      "SELECT name FROM sqlite_master "
+                      "WHERE type='table'"
+                  ).fetchall()
+
+                  assert tables, "No tables restored"
+
+              print("Restored database integrity: OK")
+              print("Restored tables:", tables)
+
+              original_hash = hashlib.sha256(
+                  restore.DATABASE.read_bytes()
+              ).hexdigest()
+
+              restore.restore_database()
+
+              final_hash = hashlib.sha256(
+                  restore.DATABASE.read_bytes()
+              ).hexdigest()
+
+              assert original_hash == final_hash, \
+                  "Existing database was modified"
+
+              print("Existing database protection: OK")
+              print("ALL RESTORATION TESTS PASSED")
+          PY
