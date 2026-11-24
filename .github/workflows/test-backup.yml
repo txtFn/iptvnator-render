@@ -1,0 +1,51 @@
+
+name: Test IPTVnator SQLite Backup
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install encryption dependency
+        run: python -m pip install cryptography
+
+      - name: Create disposable SQLite database
+        run: |
+          sudo mkdir -p /data/databases
+          sudo chown -R "$(id -u):$(id -g)" /data
+
+          python - <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect(
+              "/data/databases/iptvnator.db"
+          )
+          db.execute(
+              "CREATE TABLE test_backup (id INTEGER PRIMARY KEY, name TEXT)"
+          )
+          db.execute(
+              "INSERT INTO test_backup (name) VALUES (?)",
+              ("IPTVnator test",)
+          )
+          db.commit()
+          db.close()
+          PY
+
+      - name: Test encrypted backup
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+        run: python scripts/backup.py
