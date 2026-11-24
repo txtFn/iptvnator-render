@@ -1,0 +1,431 @@
+
+name: Inspect IPTVnator Production Database
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iptvnator-production-restore-test
+  cancel-in-progress: false
+
+jobs:
+  inspect-production-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t iptvnator-inspect:test .
+
+      - name: Prepare isolated storage
+        run: |
+          mkdir -p inspection-data
+          chmod 777 inspection-data
+
+          test ! -f inspection-data/databases/iptvnator.db
+
+          echo "PASS: Empty storage verified"
+
+      - name: Start isolated IPTVnator container
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          GITHUB_BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          docker run -d \
+            --name iptvnator-inspect \
+            --memory=512m \
+            --memory-swap=512m \
+            --cpus=0.1 \
+            -p 127.0.0.1:10000:10000 \
+            -e BACKUP_ENCRYPTION_KEY \
+            -e GITHUB_BACKUP_TOKEN \
+            -e BACKUP_TEST_MODE=0 \
+            -e BACKUP_UPLOAD_ENABLED=0 \
+            -e ALLOW_INITIAL_SETUP=0 \
+            -e GITHUB_BACKUP_REPO=txtFn/iptvnator-backups \
+            -v "$PWD/inspection-data:/data" \
+            iptvnator-inspect:test
+
+      - name: Wait for IPTVnator startup
+        run: |
+          for i in $(seq 1 40); do
+
+            if curl -fsS --max-time 5 \
+              http://localhost:10000/ \
+              -o /dev/null; then
+
+              echo "PASS: IPTVnator is responding"
+              exit 0
+            fi
+
+            if [ "$(docker inspect \
+              -f '{{.State.Running}}' \
+              iptvnator-inspect)" != "true" ]; then
+
+              echo "Container stopped unexpectedly"
+              exit 1
+            fi
+
+            sleep 5
+
+          done
+
+          echo "Startup timed out"
+          exit 1
+
+      - name: Verify production restoration
+        run: |
+          docker logs iptvnator-inspect \
+            > restore.log 2>&1
+
+          grep -F "backups/iptvnator.db.enc" restore.log
+
+          grep -F "SQLite database restored successfully" \
+            restore.log
+
+          grep -F "Automatic uploads disabled" \
+            restore.log
+
+          echo "PASS: Production database restored"
+
+      - name: Inspect database files
+        run: |
+          docker exec iptvnator-inspect \
+            ls -lh /data/databases/
+
+      - name: Inspect database table counts
+        run: |
+          docker exec -i iptvnator-inspect python3 - <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect(
+              "file:/data/databases/iptvnator.db?mode=ro",
+              uri=True,
+          )
+
+          print("=== DATABASE INTEGRITY ===")
+          result = db.execute(
+              "PRAGMA integrity_check"
+          ).fetchone()[0]
+
+          print(result)
+          assert result == "ok"
+
+          print("\n=== TABLE ROW COUNTS ===")
+
+          tables = db.execute("""
+              SELECT name
+              FROM sqlite_master
+              WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+              ORDER BY name
+          """).fetchall()
+
+          for (table,) in tables:
+              try:
+                  identifier = '"' + table.replace('"', '""') + '"'
+                  count = db.execute(
+                      f"SELECT COUNT(*) FROM {identifier}"
+                  ).fetchone()[0]
+
+                  print(f"{table}: {count}")
+
+              except sqlite3.Error:
+                  print(f"{table}: inspection unavailable")
+
+          db.close()
+          PY
+
+      - name: Inspect playlist metadata
+        run: |
+          docker exec -i iptvnator-inspect python3 - <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect(
+              "file:/data/databases/iptvnator.db?mode=ro",
+              uri=True,
+          )
+
+          print("=== PLAYLIST METADATA ===")
+
+          rows = db.execute("""
+              SELECT
+                  type,
+                  count,
+                  LENGTH(COALESCE(payload, '')),
+                  LENGTH(COALESCE(favorites, '')),
+                  LENGTH(COALESCE(recently_viewed, '')),
+                  CASE
+                      WHEN url IS NOT NULL AND url != ''
+                      THEN 1 ELSE 0
+                  END,
+                  CASE
+                      WHEN filePath IS NOT NULL AND filePath != ''
+                      THEN 1 ELSE 0
+                  END
+              FROM playlists
+          """).fetchall()
+
+          for index, row in enumerate(rows, 1):
+              print(f"\nPlaylist #{index}")
+              print(f"Type: {row[0]}")
+              print(f"Stored channel count: {row[1]}")
+              print(f"Payload length: {row[2]}")
+              print(f"Favorites length: {row[3]}")
+              print(f"Recently viewed length: {row[4]}")
+              print(f"Source URL present: {bool(row[5])}")
+              print(f"File path present: {bool(row[6])}")
+
+          db.close()
+          PY
+
+      - name: Inspect playlist payload structure
+        run: |
+          docker exec -i iptvnator-inspect python3 - <<'PY'
+          import sqlite3
+          import json
+
+          db = sqlite3.connect(
+              "file:/data/databases/iptvnator.db?mode=ro",
+              uri=True,
+          )
+
+          def inspect(value, path="payload", depth=0):
+              if depth > 5:
+                  return
+
+              if isinstance(value, dict):
+                  print(f"{path}: object ({len(value)} fields)")
+
+                  for key in (
+                      "channels",
+                      "items",
+                      "entries",
+                      "streams",
+                      "groups",
+                      "categories",
+                      "playlist",
+                      "data",
+                      "content",
+                      "favorites",
+                  ):
+                      if key in value:
+                          inspect(
+                              value[key],
+                              f"{path}.{key}",
+                              depth + 1,
+                          )
+
+              elif isinstance(value, list):
+                  print(f"{path}: array ({len(value)} entries)")
+
+              elif isinstance(value, str):
+                  print(f"{path}: string ({len(value)} characters)")
+
+              elif value is None:
+                  print(f"{path}: null")
+
+              else:
+                  print(f"{path}: {type(value).__name__}")
+
+          rows = db.execute(
+              "SELECT payload FROM playlists"
+          ).fetchall()
+
+          print("=== PLAYLIST PAYLOAD STRUCTURE ===")
+
+          for index, (payload,) in enumerate(rows, 1):
+              print(f"\nPlaylist #{index}")
+
+              if not payload:
+                  print("Payload is empty")
+                  continue
+
+              try:
+                  parsed = json.loads(payload)
+                  inspect(parsed)
+
+              except (ValueError, TypeError):
+                  print("Payload is not directly readable JSON")
+                  print(f"Payload length: {len(payload)}")
+
+          db.close()
+          PY
+
+      - name: Inspect channel and category storage
+        run: |
+          docker exec -i iptvnator-inspect python3 - <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect(
+              "file:/data/databases/iptvnator.db?mode=ro",
+              uri=True,
+          )
+
+          print("=== CATEGORY COUNTS ===")
+
+          for kind, count in db.execute("""
+              SELECT type, COUNT(*)
+              FROM categories
+              GROUP BY type
+          """):
+              print(f"{kind}: {count}")
+
+          print("\n=== CONTENT COUNTS ===")
+
+          for kind, count in db.execute("""
+              SELECT type, COUNT(*)
+              FROM content
+              GROUP BY type
+          """):
+              print(f"{kind}: {count}")
+
+          print("\n=== CONTENT ASSOCIATED WITH PLAYLISTS ===")
+
+          rows = db.execute("""
+              SELECT
+                  p.type,
+                  COUNT(DISTINCT c.id),
+                  COUNT(DISTINCT t.id)
+              FROM playlists p
+              LEFT JOIN categories c
+                  ON c.playlist_id = p.id
+              LEFT JOIN content t
+                  ON t.category_id = c.id
+              GROUP BY p.id, p.type
+          """).fetchall()
+
+          for index, row in enumerate(rows, 1):
+              print(f"Playlist #{index}")
+              print(f"Type: {row[0]}")
+              print(f"Categories: {row[1]}")
+              print(f"Content records: {row[2]}")
+
+          db.close()
+          PY
+
+      - name: Inspect favorites and server-side state
+        run: |
+          docker exec -i iptvnator-inspect python3 - <<'PY'
+          import sqlite3
+
+          db = sqlite3.connect(
+              "file:/data/databases/iptvnator.db?mode=ro",
+              uri=True,
+          )
+
+          tables = [
+              "favorites",
+              "favorite_local_records",
+              "favorite_server_receipts",
+              "favorite_server_states",
+              "recently_viewed",
+              "history_local_records",
+              "history_server_states",
+              "playback_positions",
+              "server_playlist_meta",
+              "server_profiles",
+              "server_user_state",
+              "app_state",
+              "epg_channels",
+              "epg_programs",
+          ]
+
+          print("=== SERVER-SIDE STATE ===")
+
+          for table in tables:
+              exists = db.execute("""
+                  SELECT COUNT(*)
+                  FROM sqlite_master
+                  WHERE type = 'table' AND name = ?
+              """, (table,)).fetchone()[0]
+
+              if exists:
+                  count = db.execute(
+                      f'SELECT COUNT(*) FROM "{table}"'
+                  ).fetchone()[0]
+
+                  print(f"{table}: {count}")
+              else:
+                  print(f"{table}: not present")
+
+          db.close()
+          PY
+
+      - name: Inspect storage outside SQLite
+        run: |
+          docker exec -i iptvnator-inspect python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("/data")
+
+          print("=== STORAGE SUMMARY ===")
+
+          for entry in sorted(root.iterdir()):
+              if entry.is_dir():
+                  files = [
+                      p for p in entry.rglob("*")
+                      if p.is_file() and not p.is_symlink()
+                  ]
+
+                  size = sum(p.stat().st_size for p in files)
+
+                  print(
+                      f"{entry.name}: "
+                      f"{len(files)} files, "
+                      f"{size} bytes"
+                  )
+
+              elif entry.is_file():
+                  print(
+                      f"Root-level file: "
+                      f"{entry.stat().st_size} bytes"
+                  )
+          PY
+
+      - name: Verify automatic uploads disabled
+        run: |
+          VALUE=$(docker exec iptvnator-inspect \
+            printenv BACKUP_UPLOAD_ENABLED)
+
+          test "$VALUE" = "0"
+
+          echo "PASS: Automatic uploads disabled"
+
+      - name: Display resource usage
+        run: |
+          docker stats --no-stream iptvnator-inspect
+
+          docker exec iptvnator-inspect \
+            cat /sys/fs/cgroup/memory.peak
+
+          docker exec iptvnator-inspect \
+            cat /sys/fs/cgroup/memory.events
+
+      - name: Confirm inspection completed
+        run: |
+          echo "PRODUCTION DATABASE INSPECTION COMPLETED"
+          echo "No production backup uploads performed"
+          echo "No live Render instance changes performed"
+
+      - name: Display safe diagnostic logs
+        if: always()
+        run: |
+          docker logs iptvnator-inspect 2>&1 \
+            | grep -E '^\[(Startup|Restore|Backup)\]' \
+            || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f iptvnator-inspect || true
+
+          sudo rm -rf inspection-data
+
+          rm -f restore.log
