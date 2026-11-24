@@ -38,6 +38,9 @@ jobs:
         run: |
           docker run -d \
             --name iptvnator-auto-restore \
+            --memory=512m \
+            --memory-swap=512m \
+            --cpus=0.1 \
             -p 127.0.0.1:10000:10000 \
             -e BACKUP_ENCRYPTION_KEY \
             -e GITHUB_BACKUP_TOKEN \
@@ -129,6 +132,57 @@ jobs:
         run: |
           docker stats --no-stream \
             iptvnator-auto-restore
+
+          echo "=== MEMORY LIMIT ==="
+
+          LIMIT=$(docker exec iptvnator-auto-restore \
+            cat /sys/fs/cgroup/memory.max)
+
+          echo "$LIMIT bytes"
+
+          echo "=== PEAK MEMORY USAGE ==="
+
+          PEAK=$(docker exec iptvnator-auto-restore \
+            cat /sys/fs/cgroup/memory.peak)
+
+          echo "$PEAK bytes"
+
+          awk -v peak="$PEAK" \
+            'BEGIN {printf "Peak memory: %.2f MiB\n", peak/1048576}'
+
+          awk -v peak="$PEAK" -v limit="$LIMIT" \
+            'BEGIN {printf "Peak memory utilization: %.2f%%\n", peak/limit*100}'
+
+          echo "=== MEMORY EVENTS ==="
+
+          EVENTS=$(docker exec iptvnator-auto-restore \
+            cat /sys/fs/cgroup/memory.events)
+
+          echo "$EVENTS"
+
+          echo "=== OOM STATUS ==="
+
+          OOM=$(docker inspect \
+            -f '{{.State.OOMKilled}}' \
+            iptvnator-auto-restore)
+
+          echo "OOM killed: $OOM"
+
+          echo "=== RESOURCE LIMIT VALIDATION ==="
+
+          test "$LIMIT" = "536870912"
+
+          test "$PEAK" -lt "$LIMIT"
+
+          test "$OOM" = "false"
+
+          echo "$EVENTS" | grep -x "oom 0"
+
+          echo "$EVENTS" | grep -x "oom_kill 0"
+
+          echo "PASS: Memory limit verified"
+          echo "PASS: Peak memory within limit"
+          echo "PASS: No out-of-memory events"
 
       - name: Confirm all restoration tests passed
         run: |
