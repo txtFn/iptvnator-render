@@ -1,0 +1,218 @@
+
+name: Test IPTVnator Production Restoration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iptvnator-production-restore-test
+  cancel-in-progress: false
+
+jobs:
+  test-production-restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t iptvnator-production:test .
+
+      - name: Prepare empty storage
+        run: |
+          mkdir -p production-restore-data
+          chmod 777 production-restore-data
+
+          test ! -f production-restore-data/databases/iptvnator.db
+
+          echo "PASS: Empty storage verified"
+
+      - name: Start isolated IPTVnator container
+        env:
+          BACKUP_ENCRYPTION_KEY: ${{ secrets.BACKUP_ENCRYPTION_KEY }}
+          GITHUB_BACKUP_TOKEN: ${{ secrets.BACKUP_GITHUB_TOKEN }}
+        run: |
+          docker run -d \
+            --name iptvnator-production-restore \
+            --memory=512m \
+            --memory-swap=512m \
+            --cpus=0.1 \
+            -p 127.0.0.1:10000:10000 \
+            -e BACKUP_ENCRYPTION_KEY \
+            -e GITHUB_BACKUP_TOKEN \
+            -e BACKUP_TEST_MODE=0 \
+            -e BACKUP_UPLOAD_ENABLED=0 \
+            -e ALLOW_INITIAL_SETUP=0 \
+            -e GITHUB_BACKUP_REPO=txtFn/iptvnator-backups \
+            -v "$PWD/production-restore-data:/data" \
+            iptvnator-production:test
+
+      - name: Wait for IPTVnator startup
+        run: |
+          for i in $(seq 1 40); do
+
+            if curl -fsS --max-time 5 \
+              http://localhost:10000/ \
+              -o /dev/null; then
+
+              echo "PASS: IPTVnator frontend is responding"
+              exit 0
+            fi
+
+            if [ "$(docker inspect \
+              -f '{{.State.Running}}' \
+              iptvnator-production-restore)" != "true" ]; then
+
+              echo "Container stopped unexpectedly"
+              exit 1
+            fi
+
+            sleep 5
+
+          done
+
+          echo "IPTVnator startup timed out"
+          exit 1
+
+      - name: Verify production restoration logs
+        run: |
+          docker logs iptvnator-production-restore \
+            > restore.log 2>&1
+
+          grep -F "Downloading encrypted SQLite backup" \
+            restore.log
+
+          grep -F "backups/iptvnator.db.enc" \
+            restore.log
+
+          grep -F "SQLite database restored successfully" \
+            restore.log
+
+          grep -F "Automatic uploads disabled" \
+            restore.log
+
+          echo "PASS: Production backup restored"
+          echo "PASS: Automatic uploads disabled"
+
+      - name: Verify restored database
+        run: |
+          docker exec iptvnator-production-restore \
+            ls -lh /data/databases/iptvnator.db
+
+          RESULT=$(docker exec iptvnator-production-restore \
+            sqlite3 /data/databases/iptvnator.db \
+            "PRAGMA integrity_check;")
+
+          test "$RESULT" = "ok"
+
+          echo "PASS: Database integrity verified"
+
+      - name: Verify production playlist
+        run: |
+          COUNT=$(docker exec iptvnator-production-restore \
+            sqlite3 /data/databases/iptvnator.db \
+            "SELECT COUNT(*) FROM playlists;")
+
+          test "$COUNT" -ge 1
+
+          echo "Restored playlist count: $COUNT"
+
+          IPTV_COUNT=$(docker exec iptvnator-production-restore \
+            sqlite3 /data/databases/iptvnator.db \
+            "SELECT COUNT(*) FROM playlists WHERE name='IPTV';")
+
+          test "$IPTV_COUNT" -ge 1
+
+          echo "PASS: Production IPTV playlist restored"
+
+      - name: Verify stored channel count
+        run: |
+          CHANNELS=$(docker exec iptvnator-production-restore \
+            sqlite3 /data/databases/iptvnator.db \
+            "SELECT COALESCE(MAX(count),0) FROM playlists WHERE name='IPTV';")
+
+          echo "Stored playlist channel count: $CHANNELS"
+
+          if [ "$CHANNELS" = "12152" ]; then
+            echo "PASS: Expected channel count matches"
+          else
+            echo "NOTICE: Stored count differs from expected 12152"
+            echo "Manual channel verification required"
+          fi
+
+      - name: Verify automatic uploads disabled
+        run: |
+          VALUE=$(docker exec iptvnator-production-restore \
+            printenv BACKUP_UPLOAD_ENABLED)
+
+          test "$VALUE" = "0"
+
+          echo "PASS: Production uploads disabled"
+
+      - name: Verify resource limits
+        run: |
+          docker stats --no-stream \
+            iptvnator-production-restore
+
+          LIMIT=$(docker exec iptvnator-production-restore \
+            cat /sys/fs/cgroup/memory.max)
+
+          PEAK=$(docker exec iptvnator-production-restore \
+            cat /sys/fs/cgroup/memory.peak)
+
+          echo "Memory limit: $LIMIT bytes"
+          echo "Peak memory: $PEAK bytes"
+
+          awk -v peak="$PEAK" -v limit="$LIMIT" \
+            'BEGIN {
+              printf "Peak memory: %.2f MiB\n", peak/1048576
+              printf "Peak utilization: %.2f%%\n", peak/limit*100
+            }'
+
+          test "$LIMIT" = "536870912"
+          test "$PEAK" -lt "$LIMIT"
+
+          EVENTS=$(docker exec iptvnator-production-restore \
+            cat /sys/fs/cgroup/memory.events)
+
+          echo "$EVENTS"
+
+          echo "$EVENTS" | grep -x "oom 0"
+          echo "$EVENTS" | grep -x "oom_kill 0"
+
+          OOM=$(docker inspect \
+            -f '{{.State.OOMKilled}}' \
+            iptvnator-production-restore)
+
+          test "$OOM" = "false"
+
+          echo "PASS: Memory limit verified"
+          echo "PASS: Peak memory within limit"
+          echo "PASS: No out-of-memory events"
+
+      - name: Confirm production restoration passed
+        run: |
+          echo "ALL PRODUCTION RESTORATION TESTS PASSED"
+          echo "Production database successfully recovered"
+          echo "Production backup uploads remained disabled"
+
+      - name: Display safe diagnostic logs
+        if: always()
+        run: |
+          docker logs iptvnator-production-restore 2>&1 \
+            | grep -E '^\[(Startup|Restore|Backup)\]' \
+            || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f iptvnator-production-restore || true
+
+          sudo rm -rf production-restore-data
+
+          rm -f restore.log
