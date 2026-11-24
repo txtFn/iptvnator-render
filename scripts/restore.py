@@ -12,11 +12,13 @@ DATABASE = Path("/data/databases/iptvnator.db")
 MAGIC = b"IPTVBACKUP1"
 
 REPOSITORY = "txtFn/iptvnator-backups"
+
 BACKUP_PATH = (
     "test/backup.db.enc"
     if os.getenv("BACKUP_TEST_MODE") == "1"
     else "backups/iptvnator.db.enc"
 )
+
 
 def download_backup():
     token = os.environ["GITHUB_BACKUP_TOKEN"]
@@ -32,8 +34,7 @@ def download_backup():
         "User-Agent": "IPTVnator-Restore",
     }
 
-    # Verify repository access before treating a 404
-    # response as a missing backup.
+    # Verify repository access.
     request = urllib.request.Request(
         base_url,
         headers=headers,
@@ -53,13 +54,13 @@ def download_backup():
 
     try:
         with urllib.request.urlopen(
-            request, timeout=60
+            request, timeout=120
         ) as response:
             return response.read()
 
     except urllib.error.HTTPError as error:
         if error.code == 404:
-            print("Production backup not found")
+            print("Remote backup not found")
             return None
 
         raise
@@ -81,10 +82,11 @@ def restore_database():
         )
 
     print("Downloading encrypted SQLite backup")
+    print(f"Backup location: {BACKUP_PATH}")
 
     encrypted = download_backup()
 
-        if encrypted is None:
+    if encrypted is None:
         if os.getenv("BACKUP_TEST_MODE") == "1":
             raise RuntimeError(
                 "Required test backup not found"
@@ -117,6 +119,9 @@ def restore_database():
         MAGIC,
     )
 
+    del encrypted
+    del ciphertext
+
     DATABASE.parent.mkdir(
         parents=True,
         exist_ok=True,
@@ -129,6 +134,8 @@ def restore_database():
         restored = Path(folder) / "restored.db"
 
         restored.write_bytes(recovered)
+
+        del recovered
 
         connection = sqlite3.connect(
             f"file:{restored}?mode=ro",
